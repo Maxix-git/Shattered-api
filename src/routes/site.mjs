@@ -63,6 +63,8 @@ export default async function siteRoutes(app) {
       ) t WHERE rn = 1 AND type = 'player_join'`);
     const onlineSet = new Set(onlineQ.rows.map(r => r.username));
 
+    const adminIds = (process.env.ADMIN_DISCORD_IDS || '')
+      .split(',').map(x => x.trim()).filter(Boolean);
     const playersQ = await pg.query(`
       SELECT p.username AS name,
              f.name AS faction,
@@ -72,13 +74,20 @@ export default async function siteRoutes(app) {
              COALESCE(s.longest_streak, 0) AS longest_streak,
              COALESCE(s.playtime_seconds, 0)::bigint AS playtime,
              (SELECT count(*) FROM bounties b WHERE b.target_username = p.username AND b.status = 'open') AS open_bounties,
-             (SELECT count(*) FROM bounties b WHERE b.claimed_by = dl.discord_id) AS bounty_claims
+             (SELECT count(*) FROM bounties b WHERE b.claimed_by = dl.discord_id) AS bounty_claims,
+             ($1::text[] IS NOT NULL AND dl.discord_id = ANY($1::text[])) AS is_owner,
+             (EXISTS (SELECT 1 FROM donations d3 WHERE d3.discord_id = dl.discord_id
+                      AND d3.created_at > now() - interval '30 days')
+              OR EXISTS (SELECT 1 FROM donations d4 WHERE d4.mc_name = p.username
+                      AND d4.mc_name IS NOT NULL AND d4.created_at > now() - interval '30 days')) AS is_donor,
+             (dl.discord_id IS NOT NULL) AS is_linked,
+             p.avatar_url
       FROM players p
       LEFT JOIN player_stats s ON s.player_id = p.id
       LEFT JOIN discord_links dl ON dl.player_id = p.id
       LEFT JOIN faction_members fm ON fm.discord_id = dl.discord_id
       LEFT JOIN factions f ON f.id = fm.faction_id
-      ORDER BY kills DESC NULLS LAST LIMIT 100`);
+      ORDER BY kills DESC NULLS LAST LIMIT 100`, [adminIds]);
     const players = playersQ.rows.map(r => ({
       name: r.name,
       faction: r.faction || 'Unaffiliated',
@@ -91,6 +100,10 @@ export default async function siteRoutes(app) {
       honor: honor(r.kills, r.longest_streak, r.playtime, r.bounty_claims),
       bountyClaims: r.bounty_claims,
       openBounties: r.open_bounties,
+      owner: r.is_owner === true,
+      donor: r.is_donor === true,
+      linked: r.is_linked === true,
+      avatar: r.avatar_url || null,
     }));
 
     const factionsQ = await pg.query(`
@@ -233,6 +246,7 @@ export default async function siteRoutes(app) {
     const name = user.n || did;
     const a = body.args || {};
     const sub = a.op;
+    const int0 = (v, d) => { const n = Number(v); return Number.isFinite(n) ? Math.max(1, Math.min(500, Math.trunc(n))) : d; };
 
     if (sub === 'link_claim') {
       const code = String(a.code || '').toUpperCase().slice(0, 6);
@@ -246,6 +260,12 @@ export default async function siteRoutes(app) {
         [pid, did, name]);
       await pg.query(`UPDATE link_codes SET claimed_at = now() WHERE code = $1`, [code]);
       const pn = await pg.query(`SELECT username FROM players WHERE id = $1`, [pid]);
+      if (pn.rows[0]?.username) {
+        await pg.query(
+          `INSERT INTO name_registry (mc_name, auth_type, discord_id) VALUES ($1, 'discord', $2)
+           ON CONFLICT (mc_name) DO NOTHING`, [pn.rows[0].username, did]);
+        await pg.query(`UPDATE players SET in_limbo = false WHERE id = $1`, [pid]);
+      }
       return { ok: true, msg: `Linked to ${pn.rows[0]?.username}.`, linked: true, mcName: pn.rows[0]?.username };
     }
 
@@ -278,6 +298,79 @@ export default async function siteRoutes(app) {
       await pg.query(`INSERT INTO appeals (discord_id, punishment, mc_name, reason) VALUES ($1, $2, $3, $4)`,
         [did, punishment, a.mc_name || null, reason]);
       return { ok: true, msg: 'Appeal submitted. Staff will review it.' };
+    }
+
+    if (sub === 'record_donation') {
+      if (user?.admin !== true) return { ok: false, msg: 'Owners only.' };
+      const discordId = String(a.discord_id || '').trim().slice(0, 25);
+      const mcName = String(a.mc_name || '').trim().slice(0, 16);
+      const amount = Math.max(0, Math.min(100000, Number(a.amount) || 0));
+      if (!discordId && !mcName) return { ok: false, msg: 'Enter a Discord ID or an MC name.' };
+      if (discordId && !/^\d{2,25}$/.test(discordId)) return { ok: false, msg: 'Discord ID must be numeric.' };
+      await pg.query(
+        `INSERT INTO donations (discord_id, mc_name, amount, recorded_by) VALUES ($1, $2, $3, $4)`,
+        [discordId || null, mcName || null, amount, String(user?.n || 'owner')]);
+      return { ok: true, msg: `Donation recorded — donor badge active for 30 days.` };
+    }
+
+    if (sub === 'set_avatar') {
+      const avatar = String(a.avatar || '');
+      if (!avatar.startsWith('data:image/') || avatar.length > 400_000)
+        return { ok: false, msg: 'Pick an image under ~300KB.' };
+      const pid = await pg.query(`SELECT player_id FROM discord_links WHERE discord_id = $1`, [did]);
+      if (!pid.rows.length) return { ok: false, msg: 'Link your Minecraft account first.' };
+      await pg.query(`UPDATE players SET avatar_url = $1 WHERE id = $2`, [avatar, pid.rows[0].player_id]);
+      return { ok: true, msg: 'Avatar updated.' };
+    }
+
+    if (sub === 'birthday') {
+      const month = Math.trunc(Number(a.month));
+      const day = Math.trunc(Number(a.day));
+      if (!Number.isInteger(month) || month < 1 || month > 12 || !Number.isInteger(day) || day < 1 || day > 31)
+        return { ok: false, msg: 'That is not a real date.' };
+      const daysIn = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+      if (day > daysIn[month - 1]) return { ok: false, msg: 'That month has fewer days.' };
+      const mmdd = `${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      const pid = await pg.query(`SELECT player_id FROM discord_links WHERE discord_id = $1`, [did]);
+      if (!pid.rows.length) return { ok: false, msg: 'Link your Minecraft account first.' };
+      await pg.query(`UPDATE players SET birthday = $1 WHERE id = $2`, [mmdd, pid.rows[0].player_id]);
+      return { ok: true, msg: `Birthday set: ${mmdd}. Only day and month are stored.` };
+    }
+
+    if (sub?.startsWith?.('panel_')) {
+      if (user?.admin !== true) return { ok: false, msg: 'Owners only.' };
+      const AGENT = (process.env.PANEL_AGENT_URL || '').replace(/\/$/, '');
+      const SECRET = process.env.PANEL_AGENT_SECRET;
+      if (!AGENT || !SECRET)
+        return { ok: false, msg: 'Server panel not configured (needs PANEL_AGENT_URL + PANEL_AGENT_SECRET on the API).' };
+      const map = {
+        panel_status:  { method: 'GET',  path: '/status' },
+        panel_log:     { method: 'GET',  path: `/log?lines=${int0(a.lines, 60)}` },
+        panel_files:   { method: 'GET',  path: `/files?path=${encodeURIComponent(String(a.path || ''))}` },
+        panel_read:    { method: 'GET',  path: `/file?path=${encodeURIComponent(String(a.path || ''))}` },
+        panel_write:   { method: 'POST', path: '/file' },
+        panel_exec:    { method: 'POST', path: '/exec' },
+        panel_backup:  { method: 'POST', path: '/backup' },
+        panel_backups: { method: 'GET',  path: '/backups' },
+        panel_power:   { method: 'POST', path: '/power' },
+      };
+      const spec = map[sub];
+      if (!spec) return { ok: false, msg: 'Unknown panel op.' };
+      const body = sub === 'panel_write' ? { path: String(a.path || ''), content: String(a.content ?? '') }
+        : sub === 'panel_exec' ? { command: String(a.command || '') }
+        : sub === 'panel_power' ? { action: String(a.action || '') } : undefined;
+      try {
+        const res = await fetch(`${AGENT}${spec.path}`, {
+          method: spec.method,
+          headers: { 'content-type': 'application/json', 'x-agent-secret': SECRET },
+          body: body ? JSON.stringify(body) : undefined,
+          signal: AbortSignal.timeout(20_000),
+        });
+        const data = await res.json().catch(() => ({ error: `agent http ${res.status}` }));
+        return res.ok ? { ok: true, ...data } : { ok: false, msg: data.error || `agent error ${res.status}` };
+      } catch (e) {
+        return { ok: false, msg: `Panel agent unreachable: ${e.message}` };
+      }
     }
 
     if (sub === 'privacy') {

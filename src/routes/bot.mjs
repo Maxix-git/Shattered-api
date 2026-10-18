@@ -124,7 +124,16 @@ export default async function botRoutes(app) {
        ON CONFLICT (player_id) DO UPDATE SET discord_id = EXCLUDED.discord_id,
          discord_username = EXCLUDED.discord_username, linked_at = now()`,
       [playerId, discordId, discordName]);
+
     const p = await app.pg.query(`SELECT username FROM players WHERE id = $1`, [playerId]);
+    const regName = p.rows[0]?.username;
+    if (regName) {
+      // Register the MC name to this Discord account (offline-auth name lock).
+      await app.pg.query(
+        `INSERT INTO name_registry (mc_name, auth_type, discord_id) VALUES ($1, 'discord', $2)
+         ON CONFLICT (mc_name) DO NOTHING`, [regName, discordId]);
+      await app.pg.query(`UPDATE players SET in_limbo = false WHERE lower(username) = lower($1)`, [regName]);
+    }
     return { linked: true, username: p.rows[0]?.username ?? 'player' };
   });
 
@@ -172,8 +181,15 @@ export default async function botRoutes(app) {
     const notifs = await app.pg.query(`
       SELECT id::text, kind, body, created_at FROM notifications
       WHERE discord_id = $1 AND read_at IS NULL ORDER BY created_at DESC LIMIT 5`, [did]);
+    const donorQ = await app.pg.query(`
+      SELECT COALESCE(extract(epoch from max(d.created_at) + interval '30 days'), 0)::bigint AS until
+      FROM donations d
+      WHERE (d.discord_id = $1)
+         OR (d.mc_name IS NOT NULL AND d.mc_name = (SELECT p.username FROM discord_links dl
+              JOIN players p ON p.id = dl.player_id WHERE dl.discord_id = $1))`, [did]);
+    const donorUntil = Number(donorQ.rows[0]?.until || 0);
     return {
-      linked: true, mcName: link.username, stats: link.stats,
+      linked: true, mcName: link.username, stats: link.stats, donorUntil,
       faction: fac.rows[0] ? {
         name: fac.rows[0].name, tag: fac.rows[0].tag,
         description: fac.rows[0].description,
@@ -226,10 +242,24 @@ export default async function botRoutes(app) {
     if (Date.now() - last < 60_000) return reply.code(429).send({ error: 'one bounty per minute — slow down' });
     lastBountyAt.set(did, Date.now());
     const posterName = typeof b.poster_name === 'string' ? b.poster_name.slice(0, 32) : link.username;
+    // Stat-weighted reward: dangerous targets cost more.
+    const st = await app.pg.query(
+      `SELECT p.username, s.kills, s.deaths, s.kill_streak, s.longest_streak, s.playtime_seconds
+       FROM players p LEFT JOIN player_stats s ON s.player_id = p.id
+       WHERE lower(p.username) = lower($1) LIMIT 1`, [target]);
+    if (!st.rows.length) return reply.code(404).send({ error: `no player named ${target} on the server` });
+    const r0 = st.rows[0];
+    const hours = (Number(r0.playtime_seconds) || 0) / 3600;
+    const kd = (Number(r0.kills) || 0) / Math.max(1, Number(r0.deaths) || 0);
+    let reward = 100 + (Number(r0.kills) || 0) * 10
+      + Math.max(0, (Number(r0.kills) || 0) - (Number(r0.deaths) || 0)) * 5
+      + (Number(r0.kill_streak) || 0) * 15 + (Number(r0.longest_streak) || 0) * 5
+      + hours * 3 + kd * 20;
+    reward = Math.max(100, Math.min(2000, Math.round(reward / 10) * 10));
     await app.pg.query(
-      `INSERT INTO bounties (target_username, poster_discord_id, poster_name) VALUES ($1, $2, $3)`,
-      [target, did, posterName]);
-    return { ok: true, target, reward: 100 };
+      `INSERT INTO bounties (target_username, poster_discord_id, poster_name, reward) VALUES ($1, $2, $3, $4)`,
+      [r0.username, did, posterName, reward]);
+    return { ok: true, target: r0.username, reward };
   });
 
   const lastWallAt = new Map();
@@ -258,6 +288,22 @@ export default async function botRoutes(app) {
     const did = typeof b.discord_id === 'string' ? b.discord_id : '';
     if (!/^\d{2,25}$/.test(did)) return reply.code(400).send({ error: 'discord_id required' });
     await app.pg.query(`UPDATE notifications SET read_at = now() WHERE discord_id = $1 AND read_at IS NULL`, [did]);
+    return { ok: true };
+  });
+
+
+  // Bot /appeal — feeds the shared appeals table.
+  app.post('/v1/bot/appeal', async (req, reply) => {
+    const b = req.body ?? {};
+    const did = typeof b.discord_id === 'string' ? b.discord_id.slice(0, 25) : '';
+    if (!/^\d{2,25}$/.test(did)) return reply.code(400).send({ error: 'discord_id required' });
+    const punishment = ['ban', 'mute', 'kick', 'warn'].includes(b.punishment) ? b.punishment : 'ban';
+    const mcName = typeof b.mc_name === 'string' ? b.mc_name.slice(0, 16) : null;
+    const reason = typeof b.reason === 'string' ? b.reason.trim().slice(0, 1000) : '';
+    if (!reason) return reply.code(400).send({ error: 'add a reason' });
+    await app.pg.query(
+      `INSERT INTO appeals (discord_id, punishment, mc_name, reason) VALUES ($1, $2, $3, $4)`,
+      [did, punishment, mcName, reason]);
     return { ok: true };
   });
 }
