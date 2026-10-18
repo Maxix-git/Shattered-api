@@ -1,0 +1,16 @@
+{
+  "name": "shattered-api",
+  "version": "0.1.0",
+  "private": true,
+  "engines": { "node": ">=18" },
+  "type": "module",
+  "scripts": {
+    "migrate": "node src/migrate.mjs",
+    "dev": "node --watch src/server.mjs",
+    "start": "node src/server.mjs"
+  },
+  "dependencies": {
+    "fastify": "^4.28.1",
+    "pg": "^8.13.1"
+  }
+}
