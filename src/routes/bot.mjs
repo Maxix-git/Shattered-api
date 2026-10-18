@@ -127,4 +127,137 @@ export default async function botRoutes(app) {
     const p = await app.pg.query(`SELECT username FROM players WHERE id = $1`, [playerId]);
     return { linked: true, username: p.rows[0]?.username ?? 'player' };
   });
+
+  // ---- new-feature endpoints for the website features (factions, bounties,
+  // ---- community wall, notifications). Linked = Discord account connected
+  // ---- to a Minecraft player via /link.
+
+  function honorOf(kills, longest, playtimeSec, claims) {
+    const hours = Math.floor((playtimeSec || 0) / 3600);
+    return (kills || 0) * 2 + (longest || 0) * 5 + hours * 3 + (claims || 0) * 50;
+  }
+
+  async function requireLink(discordId) {
+    const q = await app.pg.query(`
+      SELECT p.id AS player_id, p.username,
+             s.kills, s.deaths, s.kill_streak, s.longest_streak, s.playtime_seconds, p.first_join
+      FROM discord_links dl
+      JOIN players p ON p.id = dl.player_id
+      LEFT JOIN player_stats s ON s.player_id = p.id
+      WHERE dl.discord_id = $1`, [discordId]);
+    if (!q.rows.length) return null;
+    const r = q.rows[0];
+    const claims = await app.pg.query(
+      `SELECT count(*) AS c FROM bounties WHERE claimed_by = $1`, [discordId]);
+    return {
+      playerId: r.player_id, username: r.username,
+      stats: {
+        kills: r.kills || 0, deaths: r.deaths || 0,
+        streak: r.kill_streak || 0, bestStreak: r.longest_streak || 0,
+        hours: Math.floor((r.playtime_seconds || 0) / 3600),
+        honor: honorOf(r.kills, r.longest_streak, r.playtime_seconds, claims.rows[0]?.c || 0),
+      },
+    };
+  }
+
+  app.get('/v1/bot/me', async (req, reply) => {
+    const did = String(req.query?.discord_id ?? '');
+    if (!/^\d{2,25}$/.test(did)) return reply.code(400).send({ error: 'discord_id required' });
+    const link = await requireLink(did);
+    if (!link) return { linked: false };
+    const fac = await app.pg.query(`
+      SELECT f.name, f.tag, f.description, fm.role
+      FROM faction_members fm JOIN factions f ON f.id = fm.faction_id
+      WHERE fm.discord_id = $1`, [did]);
+    const notifs = await app.pg.query(`
+      SELECT id::text, kind, body, created_at FROM notifications
+      WHERE discord_id = $1 AND read_at IS NULL ORDER BY created_at DESC LIMIT 5`, [did]);
+    return {
+      linked: true, mcName: link.username, stats: link.stats,
+      faction: fac.rows[0] ? {
+        name: fac.rows[0].name, tag: fac.rows[0].tag,
+        description: fac.rows[0].description,
+        role: fac.rows[0].role, isOwner: fac.rows[0].role === 'owner',
+      } : null,
+      notifications: notifs.rows.map(r => ({
+        id: r.id, kind: r.kind, body: r.body, created_at: r.created_at,
+      })),
+    };
+  });
+
+  app.get('/v1/bot/factions', async () => {
+    const { rows } = await app.pg.query(`
+      SELECT f.name, f.tag, f.description,
+             count(*) AS members,
+             coalesce(sum(ps.kills), 0) AS kills
+      FROM factions f
+      LEFT JOIN faction_members fm ON fm.faction_id = f.id
+      LEFT JOIN discord_links dl ON dl.discord_id = fm.discord_id
+      LEFT JOIN player_stats ps ON ps.player_id = dl.player_id
+      GROUP BY f.id ORDER BY count(*) DESC, f.name LIMIT 15`);
+    return { rows };
+  });
+
+  app.get('/v1/bot/bounties', async (req) => {
+    const limit = intParam(req.query?.limit, 10, 1, 20);
+    const { rows } = await app.pg.query(
+      `SELECT id::text, target_username, poster_name, reward, created_at
+       FROM bounties WHERE status = 'open'
+       ORDER BY created_at DESC LIMIT $1`, [limit]);
+    return { rows };
+  });
+
+  const lastBountyAt = new Map();
+  app.post('/v1/bot/bounty', async (req, reply) => {
+    const b = req.body ?? {};
+    const did = typeof b.discord_id === 'string' ? b.discord_id : '';
+    const target = typeof b.target === 'string' ? b.target.trim().slice(0, 16) : '';
+    if (!/^\d{2,25}$/.test(did)) return reply.code(400).send({ error: 'discord_id required' });
+    if (!target) return reply.code(400).send({ error: 'target required' });
+    const link = await requireLink(did);
+    if (!link) return reply.code(403).send({ error: 'link your account first: /link in-game, then /link here' });
+    if (link.username.toLowerCase() === target.toLowerCase())
+      return reply.code(400).send({ error: 'you cannot put a bounty on yourself' });
+    const exists = await app.pg.query(
+      `SELECT 1 FROM bounties WHERE lower(target_username) = lower($1) AND status = 'open'`,
+      [target]);
+    if (exists.rows.length) return reply.code(409).send({ error: `a bounty is already open on ${target}` });
+    const last = lastBountyAt.get(did) ?? 0;
+    if (Date.now() - last < 60_000) return reply.code(429).send({ error: 'one bounty per minute — slow down' });
+    lastBountyAt.set(did, Date.now());
+    const posterName = typeof b.poster_name === 'string' ? b.poster_name.slice(0, 32) : link.username;
+    await app.pg.query(
+      `INSERT INTO bounties (target_username, poster_discord_id, poster_name) VALUES ($1, $2, $3)`,
+      [target, did, posterName]);
+    return { ok: true, target, reward: 100 };
+  });
+
+  const lastWallAt = new Map();
+  app.post('/v1/bot/wall', async (req, reply) => {
+    const b = req.body ?? {};
+    const did = typeof b.discord_id === 'string' ? b.discord_id : '';
+    const body = typeof b.body === 'string' ? b.body.trim().slice(0, 2000) : '';
+    if (!/^\d{2,25}$/.test(did)) return reply.code(400).send({ error: 'discord_id required' });
+    if (body.length < 3) return reply.code(400).send({ error: 'write at least a few words' });
+    const link = await requireLink(did);
+    if (!link) return reply.code(403).send({ error: 'link your account first: /link in-game, then /link here' });
+    const last = lastWallAt.get(did) ?? 0;
+    if (Date.now() - last < 30_000) return reply.code(429).send({ error: 'slow down — 30s between wall posts' });
+    lastWallAt.set(did, Date.now());
+    const author = typeof b.author === 'string' ? b.author.slice(0, 32) : link.username;
+    const title = typeof b.title === 'string' && b.title.trim() ? b.title.trim().slice(0, 80) : null;
+    const category = ['Community', 'Trade', 'Help', 'Events'].includes(b.category) ? b.category : 'Community';
+    const q = await app.pg.query(
+      `INSERT INTO community_posts (discord_id, author, category, title, body)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id::text`, [did, author, category, title, body]);
+    return { ok: true, id: q.rows[0].id, author };
+  });
+
+  app.post('/v1/bot/notifs_read', async (req, reply) => {
+    const b = req.body ?? {};
+    const did = typeof b.discord_id === 'string' ? b.discord_id : '';
+    if (!/^\d{2,25}$/.test(did)) return reply.code(400).send({ error: 'discord_id required' });
+    await app.pg.query(`UPDATE notifications SET read_at = now() WHERE discord_id = $1 AND read_at IS NULL`, [did]);
+    return { ok: true };
+  });
 }
