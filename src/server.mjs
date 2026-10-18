@@ -18,6 +18,8 @@ import linkRoutes from './routes/link.mjs';
 await app.register(linkRoutes);
 import botRoutes from './routes/bot.mjs';
 await app.register(botRoutes);
+import siteRoutes from './routes/site.mjs';
+await app.register(siteRoutes);
 
 app.get('/health', async () => {
   let db = 'down';

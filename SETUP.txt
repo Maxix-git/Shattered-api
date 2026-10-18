@@ -1,0 +1,37 @@
+SHATTERED SMP — API DEPLOY (Render + Neon)
+==========================================
+
+WHAT'S NEW IN THIS BUILD
+- migration 005_site_features.sql: factions, faction_members, bounties,
+  community_posts, donations, notifications, appeals, player privacy columns.
+- src/routes/site.mjs: POST /api/site/rpc (Bearer SITE_API_KEY) — ops live/me/act.
+  This is the single endpoint the new website calls for all data + write actions.
+- .env.example updated with SITE_API_KEY and ASSISTANT_NAME.
+
+STEP 1 — RUN THE MIGRATION ON NEON
+The agent's sandbox cannot reach Neon (port 5432 is blocked on its plan), so
+run this once from a PC or Termux. From inside this folder:
+
+  npm install
+  DATABASE_URL="<YOUR FULL NEON URL>" npm run migrate
+
+Use your full Neon connection string. If your tool rejects
+`channel_binding=verify-full`, drop that param and keep `sslmode=require`.
+Expected output: ok 001_core.sql … ok 005_site_features.sql (all 5).
+
+STEP 2 — RENDER ENV VARS (update in the Render dashboard)
+- DATABASE_URL        = your Neon connection string
+- SITE_API_KEY        = a new 32+ char hex secret:  openssl rand -hex 32
+                       (use the SAME value on Vercel for the website)
+- ASSISTANT_NAME      = Shard
+- (keep) BOT_SECRET, INGEST_SECRET, etc. as before
+
+STEP 3 — RENDER START COMMAND
+Make sure the start command runs migrations then starts:
+  npm run migrate && npm start
+(This makes Render apply any new migration on every redeploy, idempotent.)
+
+STEP 4 — DEPLOY
+Push this folder to your GitHub repo (Shattered-api). Render auto-deploys.
+Verify:  GET https://shattered-api.onrender.com/health  -> { db: "up" }
+         POST /api/site/rpc with no key -> 401 (auth works).
