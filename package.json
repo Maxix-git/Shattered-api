@@ -2,7 +2,9 @@
   "name": "shattered-api",
   "version": "0.1.0",
   "private": true,
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "type": "module",
   "scripts": {
     "migrate": "node src/migrate.mjs",
@@ -10,6 +12,7 @@
     "start": "node src/server.mjs"
   },
   "dependencies": {
+    "dotenv": "^18.0.8",
     "fastify": "^4.28.1",
     "pg": "^8.13.1"
   }

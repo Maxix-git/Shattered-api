@@ -1,6 +1,6 @@
 // Simple forward-only migration runner.
 // Applies every .sql in migrations/ that hasn't run yet, tracked in schema_migrations.
-import './load-env.mjs'; // must be first — loads .env before we read DATABASE_URL
+import 'dotenv/config';
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';

@@ -1,5 +1,5 @@
 // Shattered SMP API — plugin ingestion + public reads.
-import './load-env.mjs'; // must be first — loads .env before any module reads env
+import 'dotenv/config'; // classic dotenv — loads .env first, real env always wins
 
 import Fastify from 'fastify';
 import pg from 'pg';
@@ -25,6 +25,7 @@ await app.register(chatRoutes);
 import siteRoutes from './routes/site.mjs';
 await app.register(siteRoutes);
 
+app.get('/', async () => ({ status: 'ok', service: 'shattered-api', hint: 'try /health' }));
 app.get('/health', async () => {
   let db = 'down';
   try { await pool.query('SELECT 1'); db = 'up'; } catch {}
