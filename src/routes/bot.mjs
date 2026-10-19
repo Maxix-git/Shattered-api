@@ -30,6 +30,22 @@ function intParam(v, def, min, max) {
 }
 
 export default async function botRoutes(app) {
+// GET /v1/bot/announcements — pending server announcements (web dashboard queue).
+// Marks them posted so each is delivered exactly once, even across bot restarts.
+app.get('/v1/bot/announcements', async () => {
+  const rows = await app.pg.query(
+    `SELECT id, author, body, created_at FROM announcements
+     WHERE posted_at IS NULL ORDER BY id ASC LIMIT 25`);
+  if (rows.rows.length) {
+    await app.pg.query(
+      `UPDATE announcements SET posted_at = now() WHERE id = ANY($1::bigint[])`,
+      [rows.rows.map((r) => r.id)]);
+  }
+  return { announcements: rows.rows.map((r) => ({
+    id: String(r.id), author: r.author, body: r.body, created_at: r.created_at,
+  })) };
+});
+
   app.addHook('preHandler', async (req, reply) => {
     if (!req.url.startsWith('/v1/bot/')) return;
     const secret = process.env.BOT_SECRET;

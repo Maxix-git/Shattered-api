@@ -276,9 +276,22 @@ export default async function siteRoutes(app) {
         `SELECT p.username FROM discord_links dl JOIN players p ON p.id = dl.player_id WHERE dl.discord_id = $1`, [did]);
       if (selfName.rows[0] && selfName.rows[0].username.toLowerCase() === target.toLowerCase())
         return { ok: false, msg: 'You cannot bounty yourself.' };
-      await pg.query(`INSERT INTO bounties (target_username, poster_discord_id, poster_name)
-        VALUES ($1, $2, $3)`, [target, did, name]);
-      return { ok: true, msg: `Mark posted for ${target}. −100 Honor on claim by the killer.` };
+      // Stat-weighted reward, same formula as the bot's /bounty.
+      const st = await pg.query(
+        `SELECT p.username, s.kills, s.deaths, s.kill_streak, s.longest_streak, s.playtime_seconds
+         FROM players p LEFT JOIN player_stats s ON s.player_id = p.id
+         WHERE lower(p.username) = lower($1) LIMIT 1`, [target]);
+      const r0 = st.rows[0] || { username: target, kills: 0, deaths: 0, kill_streak: 0, longest_streak: 0, playtime_seconds: 0 };
+      const hours = (Number(r0.playtime_seconds) || 0) / 3600;
+      const kd = (Number(r0.kills) || 0) / Math.max(1, Number(r0.deaths) || 0);
+      let reward = 100 + (Number(r0.kills) || 0) * 10
+        + Math.max(0, (Number(r0.kills) || 0) - (Number(r0.deaths) || 0)) * 5
+        + (Number(r0.kill_streak) || 0) * 15 + (Number(r0.longest_streak) || 0) * 5
+        + hours * 3 + kd * 20;
+      reward = Math.max(100, Math.min(2000, Math.round(reward / 10) * 10));
+      await pg.query(`INSERT INTO bounties (target_username, poster_discord_id, poster_name, reward)
+        VALUES ($1, $2, $3, $4)`, [r0.username, did, name, reward]);
+      return { ok: true, msg: `Bounty posted on ${r0.username}: ${reward} Honor (auto-priced from their stats).` };
     }
 
     if (sub === 'post') {
@@ -432,6 +445,114 @@ export default async function siteRoutes(app) {
     if (sub === 'notifs_read') {
       await pg.query(`UPDATE notifications SET read_at = now() WHERE discord_id = $1 AND read_at IS NULL`, [did]);
       return { ok: true, msg: 'All caught up.' };
+    }
+
+if (sub === 'site_announce') {
+      if (user?.admin !== true) return { ok: false, msg: 'Owners only.' };
+      const text = String(a.body || '').trim().slice(0, 500);
+      if (!text) return { ok: false, msg: 'Write an announcement first.' };
+      await pg.query(
+        `INSERT INTO announcements (author, body, source) VALUES ($1, $2, 'web')`,
+        [String(user?.n || 'owner'), text]);
+      return { ok: true, msg: 'Announcement queued — the bot posts it to #announcements within seconds.' };
+    }
+
+    if (sub === 'owner_dash') {
+      if (user?.admin !== true) return { ok: false, msg: 'Owners only.' };
+      const stats = await pg.query(`
+        SELECT (SELECT count(*) FROM players) AS players,
+               (SELECT count(*) FROM discord_links) AS linked,
+               (SELECT count(*) FROM bounties WHERE status = 'open') AS open_bounties,
+               (SELECT count(*) FROM appeals WHERE status = 'open') AS open_appeals,
+               (SELECT COALESCE(sum(amount), 0) FROM donations
+                 WHERE created_at > now() - interval '30 days') AS donations_30d`);
+      const dons = await pg.query(`
+        SELECT id, COALESCE(mc_name, discord_id) AS who, amount, created_at
+        FROM donations ORDER BY created_at DESC LIMIT 10`);
+      const apps = await pg.query(`
+        SELECT id, COALESCE(mc_name, 'unknown') AS mc_name, discord_id, punishment,
+               reason, status, COALESCE(resolution, '') AS resolution, created_at
+        FROM appeals ORDER BY created_at DESC LIMIT 15`);
+      const bts = await pg.query(`
+        SELECT b.id::text, b.target_username, b.poster_name, b.reward, b.created_at
+        FROM bounties b WHERE b.status = 'open' ORDER BY b.created_at DESC LIMIT 20`);
+      const anns = await pg.query(`
+        SELECT id, author, body, created_at, posted_at IS NOT NULL AS posted
+        FROM announcements ORDER BY created_at DESC LIMIT 6`);
+      const ago = (t) => {
+        const s = Math.floor((Date.now() - new Date(t).getTime()) / 1000);
+        if (s < 60) return 'just now';
+        if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+        if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+        return `${Math.floor(s / 86400)}d ago`;
+      };
+      return {
+        ok: true, msg: '',
+        data: {
+          stats: {
+            players: Number(stats.rows[0].players), linked: Number(stats.rows[0].linked),
+            openBounties: Number(stats.rows[0].open_bounties), openAppeals: Number(stats.rows[0].open_appeals),
+            donations30d: Number(stats.rows[0].donations_30d),
+          },
+          donations: dons.rows.map(r => ({ id: r.id, who: r.who, amount: Number(r.amount), time: ago(r.created_at) })),
+          appeals: apps.rows.map(r => ({
+            id: r.id, mcName: r.mc_name, discordId: r.discord_id, punishment: r.punishment,
+            reason: r.reason, status: r.status, resolution: r.resolution, time: ago(r.created_at),
+          })),
+          bounties: bts.rows.map(r => ({
+            id: r.id, target: r.target_username, poster: r.poster_name,
+            reward: r.reward, time: ago(r.created_at),
+          })),
+          announcements: anns.rows.map(r => ({
+            id: r.id, author: r.author, body: r.body, posted: r.posted, time: ago(r.created_at),
+          })),
+        },
+      };
+    }
+
+    if (sub === 'resolve_appeal') {
+      if (user?.admin !== true) return { ok: false, msg: 'Owners only.' };
+      const id = Math.trunc(Number(a.id));
+      const resolution = a.resolution === 'accepted' ? 'accepted' : 'denied';
+      if (!Number.isInteger(id)) return { ok: false, msg: 'Pick an appeal.' };
+      const r = await pg.query(
+        `UPDATE appeals SET status = 'resolved', resolution = $1, resolved_by = $2, resolved_at = now()
+         WHERE id = $3 AND status = 'open' RETURNING discord_id, mc_name, punishment`,
+        [resolution, String(user?.n || 'owner'), id]);
+      if (!r.rows.length) return { ok: false, msg: 'Appeal not found or already resolved.' };
+      const ap = r.rows[0];
+      await pg.query(
+        `INSERT INTO notifications (discord_id, kind, body) VALUES ($1, 'appeal', $2)`,
+        [ap.discord_id,
+         `Your ${ap.punishment} appeal was ${resolution}.`]);
+      return { ok: true, msg: `Appeal ${resolution}. The player has been notified.` };
+    }
+
+    if (sub === 'my_bounties') {
+      const r = await pg.query(
+        `SELECT b.id::text, b.target_username, b.reward, b.created_at
+         FROM bounties b WHERE b.poster_discord_id = $1 AND b.status = 'open'
+         ORDER BY b.created_at DESC LIMIT 25`, [did]);
+      const ago = (t) => {
+        const s = Math.floor((Date.now() - new Date(t).getTime()) / 1000);
+        if (s < 60) return 'just now';
+        if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+        if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+        return `${Math.floor(s / 86400)}d ago`;
+      };
+      return { ok: true, msg: '', data: { bounties:
+        r.rows.map(x => ({ id: x.id, target: x.target_username, reward: x.reward, time: ago(x.created_at) })) } };
+    }
+
+    if (sub === 'bounty_cancel') {
+      const id = Math.trunc(Number(a.id));
+      if (!Number.isInteger(id)) return { ok: false, msg: 'Pick a bounty.' };
+      const r = await pg.query(
+        `UPDATE bounties SET status = 'cancelled', claimed_at = now()
+         WHERE id = $1 AND poster_discord_id = $2 AND status = 'open'`, [id, did]);
+      return r.rowCount
+        ? { ok: true, msg: 'Bounty cancelled — it is off the board.' }
+        : { ok: false, msg: 'Only your own open bounties can be cancelled.' };
     }
 
     return { ok: false, msg: 'Unknown action.' };
