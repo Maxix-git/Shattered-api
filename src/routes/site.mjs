@@ -161,12 +161,37 @@ export default async function siteRoutes(app) {
              (SELECT EXTRACT(epoch FROM now() - min(first_join)) / 86400 FROM players) AS age`);
     const m = metaQ.rows[0] || {};
 
+    // Plugin heartbeat = the authoritative "is the server up" signal.
+    // (The plugin beats every 30s; >90s old means it stopped.)
+    let heartbeat = null;
+    try {
+      const hb = await pg.query(`
+        SELECT online_players, max_players, tps, motd, version,
+               EXTRACT(EPOCH FROM (now() - recorded_at))::int AS age
+        FROM server_status ORDER BY recorded_at DESC LIMIT 1`);
+      const h = hb.rows[0];
+      if (h) {
+        heartbeat = {
+          live: h.age <= 90,
+          ageSeconds: h.age,
+          playersOnline: h.online_players,
+          playersMax: h.max_players,
+          tps: Math.round(Number(h.tps) * 10) / 10,
+          motd: h.motd || '',
+          version: h.version || '',
+        };
+      }
+    } catch (e) {
+      app.log.error({ err: e.message }, 'heartbeat lookup failed');
+    }
+
     return {
       players, factions, posts, news: [], feed, bounties, zones,
       meta: {
         players: Number(m.players || 0), kills: Number(m.kills || 0),
         factions: Number(m.factions || 0), worldAgeDays: Math.floor(m.age || 0),
       },
+      heartbeat,
     };
   }
 
